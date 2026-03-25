@@ -328,6 +328,22 @@ impl Actor<TransportError> for ProtocolActor {
     }
 }
 
+impl Transport {
+    /// Get a clone of the underlying iroh Endpoint.
+    ///
+    /// Use this to call `endpoint.add_endpoint_info()` before dialing
+    /// to provide the peer's relay URL and/or IP addresses upfront,
+    /// avoiding DNS lookup delays.
+    pub fn endpoint(&self) -> Result<iroh::Endpoint, TransportError> {
+        self.protocol
+            .api
+            .call_blocking(act_ok!(actor => async move { actor.endpoint.clone() }))
+            .map_err(|e| TransportError {
+                kind: TransportErrorKind::Listen(format!("Failed to get endpoint: {e}")),
+            })
+    }
+}
+
 impl libp2p::Transport for Transport {
     type Output = (PeerId, libp2p::core::muxing::StreamMuxerBox);
 
