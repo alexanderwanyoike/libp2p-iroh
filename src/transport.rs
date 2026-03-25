@@ -216,8 +216,18 @@ impl Actor<TransportError> for ProtocolActor {
     async fn run(&mut self) -> Result<(), TransportError> {
         loop {
             tokio::select! {
-                Ok(action) = self.rx.recv_async() => {
-                    action(self).await;
+                result = self.rx.recv_async() => {
+                    match result {
+                        Ok(action) => action(self).await,
+                        Err(_) => {
+                            tracing::warn!("ProtocolActor channel closed, shutting down");
+                            return Err(TransportError {
+                                kind: TransportErrorKind::Listen(
+                                    "Actor channel closed".to_string(),
+                                ),
+                            });
+                        }
+                    }
                 }
             }
         }
