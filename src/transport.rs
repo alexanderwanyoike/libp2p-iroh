@@ -172,6 +172,100 @@ impl Transport {
             protocol,
         })
     }
+
+    /// Create a new transport with a fixed UDP bind port.
+    ///
+    /// This is useful for servers behind firewalls where the UDP port must be known in advance.
+    pub async fn new_with_port(
+        keypair: Option<&libp2p::identity::Keypair>,
+        port: u16,
+    ) -> Result<Self, TransportError> {
+        tracing::debug!("Transport::new_with_port - Creating transport on port {}", port);
+        let (transport_events_tx, transport_events_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let (secret_key, peer_id) = if let Some(kp) = keypair {
+            let sk = helper::libp2p_keypair_to_iroh_secret(kp).ok_or_else(|| TransportError {
+                kind: TransportErrorKind::Listen(
+                    "Failed to convert libp2p keypair to iroh secret key".to_string(),
+                ),
+            })?;
+            let pid = libp2p::PeerId::from(kp.public());
+            (sk, pid)
+        } else {
+            let sk = iroh::SecretKey::generate(&mut rand::rng());
+            let node_id = sk.public();
+            let ed25519_pubkey = libp2p::identity::ed25519::PublicKey::try_from_bytes(
+                node_id.as_bytes(),
+            )
+            .map_err(|e| TransportError {
+                kind: TransportErrorKind::Listen(format!(
+                    "Failed to create libp2p public key from iroh node id: {e}"
+                )),
+            })?;
+            let libp2p_pubkey = libp2p::identity::PublicKey::from(ed25519_pubkey);
+            let pid = libp2p::PeerId::from_public_key(&libp2p_pubkey);
+            (sk, pid)
+        };
+
+        let (waiter_tx, mut waiter_rx) = tokio::sync::mpsc::channel(1);
+
+        tokio::spawn({
+            let transport_events_tx = transport_events_tx.clone();
+            let secret_key = secret_key.clone();
+            async move {
+                let bind_addr = format!("0.0.0.0:{}", port);
+                let builder = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+                    .secret_key(secret_key);
+                let builder = match builder.bind_addr(&bind_addr) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        let _ = waiter_tx
+                            .send(Err(TransportError {
+                                kind: TransportErrorKind::Listen(format!(
+                                    "Invalid bind address: {e}"
+                                )),
+                            }))
+                            .await;
+                        return;
+                    }
+                };
+                match builder.bind().await {
+                    Ok(endpoint) => {
+                        tracing::info!(
+                            "Transport::new_with_port - Iroh endpoint bound to port {}",
+                            port
+                        );
+                        let protocol = Protocol::new(endpoint.clone(), transport_events_tx);
+                        let _ = waiter_tx.send(Ok(protocol)).await;
+                    }
+                    Err(e) => {
+                        tracing::error!("Transport::new_with_port - Failed to bind: {}", e);
+                        let _ = waiter_tx
+                            .send(Err(TransportError {
+                                kind: TransportErrorKind::Listen(e.to_string()),
+                            }))
+                            .await;
+                    }
+                }
+            }
+        });
+
+        let protocol = waiter_rx.recv().await.ok_or_else(|| TransportError {
+            kind: TransportErrorKind::Listen(
+                "Failed to receive transport from initialization".to_string(),
+            ),
+        })??;
+
+        Ok(Transport {
+            transport_events_tx,
+            transport_events_rx,
+            _secret_key: secret_key.clone(),
+            node_id: secret_key.public(),
+            peer_id,
+            timeout: std::time::Duration::from_secs(300),
+            protocol,
+        })
+    }
 }
 
 impl Protocol {
