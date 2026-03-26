@@ -487,13 +487,29 @@ impl libp2p::Transport for Transport {
                 })
             })?;
 
+        // Extract IP address from multiaddr if present (e.g., /ip4/1.2.3.4/udp/4001/p2p/...)
+        let direct_addr = helper::extract_socket_addr(&addr);
+
         Ok(async move {
-            tracing::debug!(
-                "Transport::dial - Connecting to {:?} with ALPN {:?}",
-                node_id,
-                std::str::from_utf8(Protocol::ALPN)
-            );
-            let connecting = endpoint.connect(node_id, Protocol::ALPN);
+            // Build EndpointAddr with direct IP if available
+            let endpoint_addr = if let Some(socket_addr) = direct_addr {
+                tracing::info!(
+                    "Transport::dial - Connecting to {:?} with direct addr {} and ALPN {:?}",
+                    node_id, socket_addr,
+                    std::str::from_utf8(Protocol::ALPN)
+                );
+                let mut ea = iroh::EndpointAddr::from(node_id);
+                ea.addrs.insert(iroh::TransportAddr::Ip(socket_addr));
+                ea
+            } else {
+                tracing::debug!(
+                    "Transport::dial - Connecting to {:?} with ALPN {:?}",
+                    node_id,
+                    std::str::from_utf8(Protocol::ALPN)
+                );
+                iroh::EndpointAddr::from(node_id)
+            };
+            let connecting = endpoint.connect(endpoint_addr, Protocol::ALPN);
             let conn = connecting.await.map_err(|e| {
                 tracing::error!("Transport::dial - Connection failed: {}", e);
                 TransportError {

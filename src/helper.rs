@@ -1,5 +1,29 @@
+use std::net::{IpAddr, SocketAddr};
+
 use iroh::EndpointId;
 use libp2p::Multiaddr;
+
+/// Extract a SocketAddr (IP + port) from a multiaddr if present.
+/// Supports `/ip4/<addr>/udp/<port>` and `/ip4/<addr>/tcp/<port>` formats.
+pub(crate) fn extract_socket_addr(addr: &Multiaddr) -> Option<SocketAddr> {
+    let mut ip: Option<IpAddr> = None;
+    let mut port: Option<u16> = None;
+
+    for proto in addr.iter() {
+        match proto {
+            libp2p::multiaddr::Protocol::Ip4(a) => ip = Some(IpAddr::V4(a)),
+            libp2p::multiaddr::Protocol::Ip6(a) => ip = Some(IpAddr::V6(a)),
+            libp2p::multiaddr::Protocol::Udp(p) => port = Some(p),
+            libp2p::multiaddr::Protocol::Tcp(p) => port = Some(p),
+            _ => {}
+        }
+    }
+
+    match (ip, port) {
+        (Some(ip), Some(port)) => Some(SocketAddr::new(ip, port)),
+        _ => None,
+    }
+}
 
 pub(crate) fn multiaddr_to_iroh_node_id(addr: &Multiaddr) -> Option<EndpointId> {
     tracing::debug!(
