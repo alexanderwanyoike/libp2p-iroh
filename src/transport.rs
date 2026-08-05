@@ -15,6 +15,13 @@ use crate::{
 pub struct Transport {
     _secret_key: iroh::SecretKey,
     protocol: Protocol,
+    /// Cached at construction so libp2p's synchronous `Transport` trait
+    /// methods never round-trip through the actor. Blocking on the actor from
+    /// a sync method parks the tokio worker while the actor task may sit in
+    /// that same worker's non-stealable LIFO slot, deadlocking the runtime.
+    endpoint: iroh::Endpoint,
+    /// Local mirror of the actor's listener id for the sync trait methods.
+    listener_id: Option<libp2p::core::transport::ListenerId>,
 
     pub node_id: EndpointId,
     pub peer_id: libp2p::PeerId,
@@ -137,7 +144,7 @@ impl Transport {
                     tracing::debug!("Transport::new - Iroh endpoint created successfully");
                     let protocol = Protocol::new(endpoint.clone(), transport_events_tx);
 
-                    if waiter_tx.send(Ok(protocol)).await.is_ok() {
+                    if waiter_tx.send(Ok((protocol, endpoint))).await.is_ok() {
                         tracing::debug!("Transport::new - Protocol sent to waiter channel");
                         return;
                     }
@@ -155,7 +162,7 @@ impl Transport {
             }
         });
 
-        let protocol = waiter_rx.recv().await.ok_or_else(|| TransportError {
+        let (protocol, endpoint) = waiter_rx.recv().await.ok_or_else(|| TransportError {
             kind: TransportErrorKind::Listen(
                 "Failed to receive transport from initialization".to_string(),
             ),
@@ -170,6 +177,8 @@ impl Transport {
             peer_id,
             timeout: std::time::Duration::from_secs(300),
             protocol,
+            endpoint,
+            listener_id: None,
         })
     }
 
@@ -236,7 +245,7 @@ impl Transport {
                             port
                         );
                         let protocol = Protocol::new(endpoint.clone(), transport_events_tx);
-                        let _ = waiter_tx.send(Ok(protocol)).await;
+                        let _ = waiter_tx.send(Ok((protocol, endpoint))).await;
                     }
                     Err(e) => {
                         tracing::error!("Transport::new_with_port - Failed to bind: {}", e);
@@ -250,7 +259,7 @@ impl Transport {
             }
         });
 
-        let protocol = waiter_rx.recv().await.ok_or_else(|| TransportError {
+        let (protocol, endpoint) = waiter_rx.recv().await.ok_or_else(|| TransportError {
             kind: TransportErrorKind::Listen(
                 "Failed to receive transport from initialization".to_string(),
             ),
@@ -264,6 +273,8 @@ impl Transport {
             peer_id,
             timeout: std::time::Duration::from_secs(300),
             protocol,
+            endpoint,
+            listener_id: None,
         })
     }
 }
@@ -335,12 +346,7 @@ impl Transport {
     /// to provide the peer's relay URL and/or IP addresses upfront,
     /// avoiding DNS lookup delays.
     pub fn endpoint(&self) -> Result<iroh::Endpoint, TransportError> {
-        self.protocol
-            .api
-            .call_blocking(act_ok!(actor => async move { actor.endpoint.clone() }))
-            .map_err(|e| TransportError {
-                kind: TransportErrorKind::Listen(format!("Failed to get endpoint: {e}")),
-            })
+        Ok(self.endpoint.clone())
     }
 }
 
@@ -364,12 +370,7 @@ impl libp2p::Transport for Transport {
             _addr
         );
         // /iroh/[node-id]
-        let listener_id = self
-            .protocol
-            .api
-            .call_blocking(act_ok!(actor => async move { actor.listener_id }))
-            .map_err(libp2p::core::transport::TransportError::Other)?;
-        if listener_id.is_some() {
+        if self.listener_id.is_some() {
             tracing::warn!("Transport::listen_on - Listener already exists");
             return Err(libp2p::core::transport::TransportError::Other(
                 TransportError {
@@ -379,38 +380,41 @@ impl libp2p::Transport for Transport {
                 },
             ));
         }
+        self.listener_id = Some(id);
 
-        let endpoint = self
-            .protocol
-            .api
-            .call_blocking(act_ok!(actor => async move { actor.endpoint.clone() }))
-            .map_err(|e| {
-                tracing::error!("Transport::listen_on - Failed to get endpoint: {}", e);
-                libp2p::core::transport::TransportError::Other(TransportError {
-                    kind: TransportErrorKind::Listen(format!(
-                        "Failed to get endpoint from transport protocol: {e}"
-                    )),
-                })
-            })?;
-        tracing::debug!(
-            "Transport::listen_on - Creating router with ALPN: {:?}",
-            std::str::from_utf8(Protocol::ALPN)
-        );
-        let _router = iroh::protocol::Router::builder(endpoint.clone())
-            .accept(Protocol::ALPN, self.protocol.clone())
-            .spawn();
-        self.protocol
-            .api
-            .call_blocking(act_ok!(actor => async move {
-                actor._router = Some(_router);
-                actor.listener_id = Some(id);
-            }))
-            .map_err(|e| {
+        let endpoint = self.endpoint.clone();
+        let api = self.protocol.api.clone();
+        let protocol = self.protocol.clone();
+        // Record the listener id on the actor before the router starts
+        // accepting, so Protocol::accept never observes it unset. Done from a
+        // spawned task because blocking on the actor from this sync trait
+        // method can deadlock the worker (jolt#187).
+        tokio::spawn(async move {
+            if let Err(e) = api
+                .call(act_ok!(actor => async move {
+                    actor.listener_id = Some(id);
+                }))
+                .await
+            {
+                tracing::error!("Transport::listen_on - Failed to set listener id: {}", e);
+                return;
+            }
+            tracing::debug!(
+                "Transport::listen_on - Creating router with ALPN: {:?}",
+                std::str::from_utf8(Protocol::ALPN)
+            );
+            let router = iroh::protocol::Router::builder(endpoint)
+                .accept(Protocol::ALPN, protocol)
+                .spawn();
+            if let Err(e) = api
+                .call(act_ok!(actor => async move {
+                    actor._router = Some(router);
+                }))
+                .await
+            {
                 tracing::error!("Transport::listen_on - Failed to set router: {}", e);
-                libp2p::core::transport::TransportError::Other(TransportError {
-                    kind: TransportErrorKind::Listen(format!("Failed to set router: {e}")),
-                })
-            })?;
+            }
+        });
 
         let iroh_addr = helper::iroh_node_id_to_multiaddr(&self.node_id);
         tracing::debug!(
@@ -436,22 +440,21 @@ impl libp2p::Transport for Transport {
     }
 
     fn remove_listener(&mut self, id: libp2p::core::transport::ListenerId) -> bool {
-        let listener_id = self
-            .protocol
-            .api
-            .call_blocking(act_ok!(actor => async move { actor.listener_id }))
-            .map_err(|_| false)
-            .unwrap_or(None);
-        if let Some(current_id) = listener_id
-            && current_id == id {
-                self.protocol
-                    .api
-                    .call_blocking(act_ok!(actor => async move {
+        if self.listener_id == Some(id) {
+            self.listener_id = None;
+            let api = self.protocol.api.clone();
+            // Clear actor state asynchronously; blocking here can deadlock the
+            // worker (jolt#187).
+            tokio::spawn(async move {
+                let _ = api
+                    .call(act_ok!(actor => async move {
                         actor.listener_id = None;
+                        actor._router = None;
                     }))
-                    .ok();
-                return true;
-            }
+                    .await;
+            });
+            return true;
+        }
         false
     }
 
@@ -473,19 +476,12 @@ impl libp2p::Transport for Transport {
             })
         })?;
         tracing::debug!("Transport::dial - Extracted EndpointId: {:?}", node_id);
-        let protocol = self.protocol.clone();
 
-        let endpoint = protocol
-            .api
-            .call_blocking(act_ok!(actor => async move { actor.endpoint.clone() }))
-            .map_err(|e| {
-                tracing::error!("Transport::dial - Failed to get endpoint: {}", e);
-                libp2p::core::transport::TransportError::Other(TransportError {
-                    kind: TransportErrorKind::Dial(format!(
-                        "Failed to get endpoint from transport protocol: {e}"
-                    )),
-                })
-            })?;
+        // Use the cached endpoint. Blocking on the actor here parked the tokio
+        // worker running the swarm's owner task while the actor task could sit
+        // in that worker's non-stealable LIFO slot: a permanent deadlock that
+        // presented as daemon command starvation (jolt#187).
+        let endpoint = self.endpoint.clone();
 
         // Extract IP address from multiaddr if present (e.g., /ip4/1.2.3.4/udp/4001/p2p/...)
         let direct_addr = helper::extract_socket_addr(&addr);
