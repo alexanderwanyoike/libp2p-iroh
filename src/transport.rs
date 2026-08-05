@@ -134,6 +134,14 @@ impl Transport {
             async move {
                 tracing::debug!("Transport::new - Spawned task: Initializing iroh endpoint");
                 if let Ok(endpoint) = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+                    // The N0 preset resolves peers via DNS TXT lookups only
+                    // (outside browsers). Consumer resolvers negative-cache the
+                    // NXDOMAIN served before a freshly published record is
+                    // ingested into the zone (SOA TTL 7200s), leaving new nodes
+                    // undialable for up to two hours. The pkarr relay serves the
+                    // record over HTTPS immediately, so add it as a fallback
+                    // lookup path.
+                    .address_lookup(iroh::address_lookup::PkarrResolver::n0_dns())
                     .secret_key(secret_key)
                     .bind()
                     .await
@@ -224,6 +232,10 @@ impl Transport {
             async move {
                 let bind_addr = format!("0.0.0.0:{}", port);
                 let builder = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+                    // See Transport::new - HTTPS pkarr lookup alongside the
+                    // preset's DNS-only resolution, so fresh nodes are dialable
+                    // before their DNS TXT record propagates past negative caches.
+                    .address_lookup(iroh::address_lookup::PkarrResolver::n0_dns())
                     .secret_key(secret_key);
                 let builder = match builder.bind_addr(&bind_addr) {
                     Ok(b) => b,
