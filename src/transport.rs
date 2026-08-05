@@ -105,7 +105,7 @@ impl Transport {
             (sk, pid)
         } else {
             tracing::debug!("Transport::new - Generating new keypair");
-            let sk = iroh::SecretKey::generate(&mut rand::rng());
+            let sk = iroh::SecretKey::generate();
             let node_id = sk.public();
             let node_id_bytes = node_id.as_bytes();
             let ed25519_pubkey = libp2p::identity::ed25519::PublicKey::try_from_bytes(
@@ -209,7 +209,7 @@ impl Transport {
             let pid = libp2p::PeerId::from(kp.public());
             (sk, pid)
         } else {
-            let sk = iroh::SecretKey::generate(&mut rand::rng());
+            let sk = iroh::SecretKey::generate();
             let node_id = sk.public();
             let ed25519_pubkey = libp2p::identity::ed25519::PublicKey::try_from_bytes(
                 node_id.as_bytes(),
